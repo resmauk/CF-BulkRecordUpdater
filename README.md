@@ -1,6 +1,8 @@
 # CF-BulkApexUpdater
 Connects to Cloudflare API and update A Record and SPF record IP4 address from an old address to a new one. Aimed at usage for whole server migrations
 
+# cf\_host\_bulk
+
 > Bulk-update Cloudflare DNS **A** records (apex or subdomains), optionally delete **AAAA**, and (optionally) **sync SPF** `TXT v=spf1` entries by swapping `ip4:OLD → ip4:NEW`.
 
 <p align="left">
@@ -97,6 +99,16 @@ py .\cf_host_bulk.py .\hosts.csv --token cf_XXXX --ip 203.0.113.10 --yes
 
 ---
 
+## 🔄 New in v2.3
+
+* **`--change-www-a`** — Also update/create the **A** record for `www.<zone_apex>` to the same target IP.
+
+  * Skips if `www` is a **CNAME** (unless you pass `--replace-cname`).
+  * Respects `--update-all-a` and your `ttl` / `proxied` overrides.
+  * **Does not** touch AAAA for `www` (by design).
+
+---
+
 ## 🧪 Examples
 
 * Basic plan:
@@ -114,6 +126,21 @@ py .\cf_host_bulk.py .\hosts.csv --token cf_XXXX --ip 203.0.113.10 --yes
   ```powershell
   py .\cf_host_bulk.py .\hosts.csv --replace-cname --spf-sync --spf-scope both
   ```
+* **Plan only, including updating `www.<zone_apex>` A**:
+
+  ```powershell
+  py .\cf_host_bulk.py .\hosts.csv --change-www-a --dry-run
+  ```
+* **Real run, updating `www` and converting any `www` CNAME → A**:
+
+  ```powershell
+  py .\cf_host_bulk.py .\hosts.csv --change-www-a --replace-cname
+  ```
+* **Non-interactive (CI/RMM): update FQDNs + `www` A**:
+
+  ```powershell
+  py .\cf_host_bulk.py .\hosts.csv --change-www-a --ip 209.42.18.118 --token cf_XXXX --yes
+  ```
 
 ---
 
@@ -124,6 +151,7 @@ py .\cf_host_bulk.py .\hosts.csv --token cf_XXXX --ip 203.0.113.10 --yes
 * **Multiple A records**: If you intentionally use multiple A’s, add `--update-all-a`.
 * **Propagation**: Plan a change window; DNS propagation applies.
 * **Permissions**: Token must have `Zone:Read` & `DNS:Edit` on target zones.
+* **`--change-www-a`** does **not** modify AAAA for `www.<zone_apex>`; only the **A** record is created/updated.
 
 ---
 
@@ -135,20 +163,21 @@ Run `--help` anytime:
 py .\cf_host_bulk.py --help
 ```
 
-| Flag                           |              Default | Purpose                                     | Example             |
-| ------------------------------ | -------------------: | ------------------------------------------- | ------------------- |
-| `CSV_PATH`                     |           (required) | Path to input CSV                           | `.\hosts.csv`       |
-| `--ip IPv4`                    |               prompt | Target IPv4 for A records (validated)       | `--ip 203.0.113.10` |
-| `--token TOKEN`                |               prompt | Cloudflare **API Token** (Bearer)           | `--token cf_XXXX`   |
-| `--report PATH`                | `cf_host_report.csv` | Output audit CSV                            | `--report out.csv`  |
-| `--dry-run`                    |                  off | Show plan only; no changes                  | `--dry-run`         |
-| `--yes`                        |                  off | Skip confirmation prompt                    | `--yes`             |
-| `--csv-delim CHAR`             |                 auto | Force CSV delimiter                         | `--csv-delim ';'`   |
-| `--keep-aaaa`                  |                  off | Do **not** delete AAAA (keep IPv6)          | `--keep-aaaa`       |
-| `--update-all-a`               |                  off | Update **all** A records at the FQDN        | `--update-all-a`    |
-| `--replace-cname`              |                  off | If FQDN is CNAME, delete it and create an A | `--replace-cname`   |
-| `--spf-sync`                   |                  off | Edit SPF TXT: swap `ip4:OLD → ip4:NEW`      | `--spf-sync`        |
-| `--spf-scope {host,apex,both}` |               `host` | Where to patch SPF TXT                      | `--spf-scope both`  |
+| Flag                           |              Default | Purpose                                                                        | Example             |
+| ------------------------------ | -------------------: | ------------------------------------------------------------------------------ | ------------------- |
+| `CSV_PATH`                     |           (required) | Path to input CSV                                                              | `.\hosts.csv`       |
+| `--ip IPv4`                    |               prompt | Target IPv4 for A records (validated)                                          | `--ip 203.0.113.10` |
+| `--token TOKEN`                |               prompt | Cloudflare **API Token** (Bearer)                                              | `--token cf_XXXX`   |
+| `--report PATH`                | `cf_host_report.csv` | Output audit CSV                                                               | `--report out.csv`  |
+| `--dry-run`                    |                  off | Show plan only; no changes                                                     | `--dry-run`         |
+| `--yes`                        |                  off | Skip confirmation prompt                                                       | `--yes`             |
+| `--csv-delim CHAR`             |                 auto | Force CSV delimiter                                                            | `--csv-delim ';'`   |
+| `--keep-aaaa`                  |                  off | Do **not** delete AAAA (keep IPv6)                                             | `--keep-aaaa`       |
+| `--update-all-a`               |                  off | Update **all** A records at the FQDN                                           | `--update-all-a`    |
+| `--replace-cname`              |                  off | If FQDN is CNAME, delete it and create an A                                    | `--replace-cname`   |
+| `--spf-sync`                   |                  off | Edit SPF TXT: swap `ip4:OLD → ip4:NEW`                                         | `--spf-sync`        |
+| `--spf-scope {host,apex,both}` |               `host` | Where to patch SPF TXT                                                         | `--spf-scope both`  |
+| `--change-www-a`               |                  off | Also update/create **A** for `www.<zone_apex>` to the new IP (no AAAA changes) | `--change-www-a`    |
 
 ---
 
