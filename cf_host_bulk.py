@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# cf_host_bulk.py — v2.2
+# cf_host_bulk.py — v2.3
 # - Apex or subdomains
 # - Prompt for token + visible target IPv4 (or pass flags)
 # - Only touch A/AAAA at the exact FQDN
 # - Optional SPF sync: replace ip4:OLD -> ip4:NEW in SPF TXT at host/apex/both
 # - Skips hosts that are CNAMEs (unless --replace-cname)
+# - NEW: --change-www-a also updates A for www.<zone_apex> (no AAAA changes there)
 
 import argparse, csv, getpass, ipaddress, re, sys, time, warnings, requests
 from getpass import GetPassWarning
@@ -108,7 +109,7 @@ def prompt_token():
 
 def validate_ipv4(s):
     try:
-        ip = ipaddress.ip_address(s); 
+        ip = ipaddress.ip_address(s)
         if ip.version != 4: raise ValueError("Not IPv4")
         return str(ip)
     except Exception:
@@ -116,44 +117,29 @@ def validate_ipv4(s):
 
 # ---------- SPF sync ----------
 def spf_replace_ip4_tokens(text, old_ips, new_ip):
-    """
-    Replace ip4:OLD -> ip4:NEW; if NEW already present, remove OLD.
-    Preserve other mechanisms; handle optional /32 suffix on OLD.
-    """
-    if "v=spf1" not in text.lower(): 
+    if "v=spf1" not in text.lower():
         return text, False
-
     changed = False
-    # Ensure we don't double-add
     new_token = f"ip4:{new_ip}"
     have_new = re.search(rf"(?<![\w:]){re.escape(new_token)}(?![\w./])", text) is not None
 
     def repl(m):
         nonlocal changed
-        prefix = m.group(1) or ""  # leading space or start
-        old_ip = m.group(2)
-        cidr  = m.group(3) or ""
-        # If new already exists, drop the old token; else replace with new
+        prefix = m.group(1) or ""
+        cidr = m.group(3) or ""
         if have_new:
             changed = True
-            return prefix  # remove old token
-        # keep any /mask ONLY if it's '/32'
+            return prefix
         rep = new_token + ("/32" if cidr == "/32" else "")
         changed = True
         return prefix + rep
 
-    # match tokens like: [start/space]ip4:1.2.3.4[/32][space/end]
     pattern = rf'(^|\s)ip4:({"|".join(map(re.escape, old_ips))})(/32)?(?=$|\s)'
     new_text = re.sub(pattern, repl, text)
-    # Compact multiple spaces
     new_text = re.sub(r"\s+", " ", new_text).strip()
     return new_text, changed
 
 def spf_sync_for_names(session, token, zone_id, names, old_ips, new_ip, dry_run):
-    """
-    For each DNS name in `names`, find TXT SPF and update ip4:OLD -> ip4:NEW.
-    Returns (num_edited, details[])
-    """
     edited = 0
     details = []
     for name in names:
@@ -187,6 +173,7 @@ def main():
   py cf_host_bulk.py .\\hosts.csv --update-all-a
   py cf_host_bulk.py .\\hosts.csv --replace-cname
   py cf_host_bulk.py .\\hosts.csv --spf-sync --spf-scope both
+  py cf_host_bulk.py .\\hosts.csv --change-www-a
         """
     )
     ap.add_argument("csv_path", help="CSV with hostnames. Header can be: domain, host, hostname, fqdn, zone, name, apex, root, record.")
@@ -203,6 +190,8 @@ def main():
     ap.add_argument("--spf-sync", action="store_true", help="Also update SPF TXT: replace ip4:OLD_A_IP -> ip4:NEW_IP where found.")
     ap.add_argument("--spf-scope", choices=["host","apex","both"], default="host",
                     help="Where to search/patch SPF TXT: only the host, only the zone apex, or both. Default: host.")
+    # NEW: also change www.<zone_apex> A to new IP
+    ap.add_argument("--change-www-a", action="store_true", help="Also update/create A for www.<zone_apex> to the new IP (no AAAA changes).")
     args = ap.parse_args()
 
     # Token & IP
@@ -218,6 +207,8 @@ def main():
     print(f" • Set A → {args.ip} at each FQDN in CSV (apex or subdomains).")
     print(" • Delete AAAA at that FQDN." if not args.keep_aaaa else " • Keep AAAA unchanged.")
     print(" • Skip if the FQDN is a CNAME (unless --replace-cname).")
+    if args.change_www_a:
+        print(" • Also update/create A for www.<zone_apex> to the same IP (no AAAA changes).")
     if args.spf_sync:
         where = {"host":"the FQDN only","apex":"the zone apex only","both":"both the FQDN and the zone apex"}[args.spf_scope]
         print(f" • SPF sync enabled: in {where}, replace any ip4:<OLD_A_IP> with ip4:{args.ip}.")
@@ -229,7 +220,7 @@ def main():
         if input("Proceed? (y/N): ").strip().lower() not in ("y","yes"):
             print("Aborted."); sys.exit(0)
 
-    s = requests.Session(); s.headers.update({"User-Agent": "cf-host-bulk/2.2"})
+    s = requests.Session(); s.headers.update({"User-Agent": "cf-host-bulk/2.3"})
 
     # Verify token
     if not verify_token(s, token):
@@ -289,74 +280,128 @@ def main():
                 if cname and not args.replace_cname:
                     print(f"[SKIP] FQDN is a CNAME → {cname[0].get('content','')}. Use --replace-cname to convert.")
                     writer.writerow({"fqdn":fqdn, "zone_name":zone_name, "zone_id":zid, "notes":"CNAME present; skipped"})
-                    continue
+                    # Still allow www change if requested (www.<zone_apex>), even if fqdn skipped
+                else:
+                    # TTL/proxied parse
+                    ttl_val = None
+                    if ttl_str:
+                        try: ttl_val = int(ttl_str)
+                        except: notes.append("ttl not integer; ignored")
+                    def parse_bool(v):
+                        if (v or "").strip() == "": return None
+                        return (v or "").strip().lower() in ("1","true","yes","y")
+                    proxied_override = parse_bool(proxied_str)
 
-                # TTL/proxied parse
-                ttl_val = None
-                if ttl_str:
-                    try: ttl_val = int(ttl_str)
-                    except: notes.append("ttl not integer; ignored")
-                def parse_bool(v):
-                    if (v or "").strip() == "": return None
-                    return (v or "").strip().lower() in ("1","true","yes","y")
-                proxied_override = parse_bool(proxied_str)
+                    # If replacing CNAME, delete it now
+                    if cname and args.replace_cname and not args.dry_run:
+                        for rec in cname:
+                            print(f"[PLAN] Delete CNAME {fqdn} → {rec.get('content','')}")
+                            cf_delete(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token)
 
-                # If replacing CNAME, delete it now
-                if cname and args.replace_cname and not args.dry_run:
-                    for rec in cname:
-                        print(f"[PLAN] Delete CNAME {fqdn} → {rec.get('content','')}")
-                        cf_delete(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token)
+                    # Gather A/AAAA at FQDN
+                    a_recs    = [r for r in list_dns(s, token, zid, name=fqdn, type="A")    if r.get("name")==fqdn and r.get("type")=="A"]
+                    aaaa_recs = [r for r in list_dns(s, token, zid, name=fqdn, type="AAAA") if r.get("name")==fqdn and r.get("type")=="AAAA"]
 
-                # Gather A/AAAA at FQDN
-                a_recs    = [r for r in list_dns(s, token, zid, name=fqdn, type="A")    if r.get("name")==fqdn and r.get("type")=="A"]
-                aaaa_recs = [r for r in list_dns(s, token, zid, name=fqdn, type="AAAA") if r.get("name")==fqdn and r.get("type")=="AAAA"]
-
-                # Determine which A records we update (collect old IPs for SPF sync)
-                old_ips = []
-                if a_recs:
-                    targets = a_recs if args.update_all_a else [a_recs[0]]
-                    for idx, rec in enumerate(targets, 1):
-                        old_a = rec.get("content",""); 
-                        if old_a: old_ips.append(old_a)
+                    # Determine which A records we update (collect old IPs for SPF sync)
+                    old_ips = []
+                    if a_recs:
+                        targets = a_recs if args.update_all_a else [a_recs[0]]
+                        for idx, rec in enumerate(targets, 1):
+                            old_a = rec.get("content","")
+                            if old_a: old_ips.append(old_a)
+                            payload = {
+                                "type":"A","name":fqdn,"content":args.ip,
+                                "proxied": rec.get("proxied", False) if proxied_override is None else proxied_override,
+                                "ttl": rec.get("ttl", 1) if ttl_val is None else ttl_val
+                            }
+                            a_proxied = str(payload["proxied"]); a_ttl = str(payload["ttl"])
+                            action_a = "update"
+                            print(f"[PLAN] Update A {idx}/{len(targets)}: {old_a} → {args.ip} (proxied={a_proxied}, ttl={a_ttl})")
+                            if not args.dry_run:
+                                cf_patch(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token, payload)
+                    else:
                         payload = {
                             "type":"A","name":fqdn,"content":args.ip,
-                            "proxied": rec.get("proxied", False) if proxied_override is None else proxied_override,
-                            "ttl": rec.get("ttl", 1) if ttl_val is None else ttl_val
+                            "proxied": proxied_override if proxied_override is not None else False,
+                            "ttl": ttl_val if ttl_val is not None else 1
                         }
                         a_proxied = str(payload["proxied"]); a_ttl = str(payload["ttl"])
-                        action_a = "update"
-                        print(f"[PLAN] Update A {idx}/{len(targets)}: {old_a} → {args.ip} (proxied={a_proxied}, ttl={a_ttl})")
+                        action_a = "create"
+                        print(f"[PLAN] Create A: {fqdn} → {args.ip} (proxied={a_proxied}, ttl={a_ttl})")
                         if not args.dry_run:
-                            cf_patch(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token, payload)
-                else:
-                    payload = {
-                        "type":"A","name":fqdn,"content":args.ip,
-                        "proxied": proxied_override if proxied_override is not None else False,
-                        "ttl": ttl_val if ttl_val is not None else 1
-                    }
-                    a_proxied = str(payload["proxied"]); a_ttl = str(payload["ttl"])
-                    action_a = "create"
-                    print(f"[PLAN] Create A: {fqdn} → {args.ip} (proxied={a_proxied}, ttl={a_ttl})")
-                    if not args.dry_run:
-                        cf_post(s, f"{API_BASE}/zones/{zid}/dns_records", token, payload)
+                            cf_post(s, f"{API_BASE}/zones/{zid}/dns_records", token, payload)
 
-                # AAAA: delete unless kept
-                if not args.keep_aaaa:
-                    for rec in aaaa_recs:
-                        print(f"[PLAN] Delete AAAA: {rec.get('content')}")
-                        if not args.dry_run:
-                            cf_delete(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token)
-                        aaaa_deleted += 1
+                    # AAAA: delete unless kept
+                    if not args.keep_aaaa:
+                        for rec in aaaa_recs:
+                            print(f"[PLAN] Delete AAAA: {rec.get('content')}")
+                            if not args.dry_run:
+                                cf_delete(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token)
+                            aaaa_deleted += 1
 
-                # SPF sync (only if we have old IPs to swap)
-                if args.spf_sync and old_ips:
-                    names = []
-                    if args.spf_scope in ("host","both"): names.append(fqdn)
-                    if args.spf_scope in ("apex","both"): names.append(zone_name)
-                    edits, details = spf_sync_for_names(s, token, zid, names, old_ips, args.ip, args.dry_run)
-                    spf_edits += edits
-                    for d in details:
-                        print(f"[PLAN] {d} (ip4: old→new)")
+                    # SPF sync (only if we have old IPs to swap)
+                    if args.spf_sync and old_ips:
+                        names = []
+                        if args.spf_scope in ("host","both"): names.append(fqdn)
+                        if args.spf_scope in ("apex","both"): names.append(zone_name)
+                        edits, details = spf_sync_for_names(s, token, zid, names, old_ips, args.ip, args.dry_run)
+                        spf_edits += edits
+                        for d in details:
+                            print(f"[PLAN] {d} (ip4: old→new)")
+
+                # NEW: also update www.<zone_apex> A
+                if args.change_www_a:
+                    www_name = f"www.{zone_name}"
+                    print(f"[WWW] Processing {www_name}")
+                    cname_www = [r for r in list_dns(s, token, zid, name=www_name, type="CNAME") if r.get("name")==www_name]
+                    if cname_www and not args.replace_cname:
+                        print(f"[WWW SKIP] CNAME → {cname_www[0].get('content','')}. Use --replace-cname to convert.")
+                        notes.append("www CNAME present; skipped")
+                    else:
+                        # Remove CNAME if requested
+                        if cname_www and args.replace_cname and not args.dry_run:
+                            for rec in cname_www:
+                                print(f"[PLAN] Delete CNAME {www_name} → {rec.get('content','')}")
+                                cf_delete(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token)
+
+                        # Pull A for www
+                        www_a_recs = [r for r in list_dns(s, token, zid, name=www_name, type="A") if r.get("name")==www_name and r.get("type")=="A"]
+                        # Use same ttl/proxied overrides if parsed; if fqdn was skipped due to CNAME, parse them quickly:
+                        if 'ttl_val' not in locals():
+                            ttl_val = None
+                            if ttl_str:
+                                try: ttl_val = int(ttl_str)
+                                except: notes.append("ttl not integer; ignored")
+                        if 'proxied_override' not in locals():
+                            def parse_bool(v):
+                                if (v or "").strip() == "": return None
+                                return (v or "").strip().lower() in ("1","true","yes","y")
+                            proxied_override = parse_bool(proxied_str)
+
+                        if www_a_recs:
+                            targets = www_a_recs if args.update_all_a else [www_a_recs[0]]
+                            for idx, rec in enumerate(targets, 1):
+                                old_www_a = rec.get("content","")
+                                payload = {
+                                    "type":"A","name":www_name,"content":args.ip,
+                                    "proxied": rec.get("proxied", False) if proxied_override is None else proxied_override,
+                                    "ttl": rec.get("ttl", 1) if ttl_val is None else ttl_val
+                                }
+                                print(f"[PLAN] WWW Update A {idx}/{len(targets)}: {old_www_a} → {args.ip} (proxied={payload['proxied']}, ttl={payload['ttl']})")
+                                if not args.dry_run:
+                                    cf_patch(s, f"{API_BASE}/zones/{zid}/dns_records/{rec['id']}", token, payload)
+                            if len(www_a_recs) > 1 and not args.update_all_a:
+                                notes.append(f"www: {len(www_a_recs)-1} additional A records left untouched")
+                        else:
+                            payload = {
+                                "type":"A","name":www_name,"content":args.ip,
+                                "proxied": proxied_override if proxied_override is not None else False,
+                                "ttl": ttl_val if ttl_val is not None else 1
+                            }
+                            print(f"[PLAN] WWW Create A: {www_name} → {args.ip} (proxied={payload['proxied']}, ttl={payload['ttl']})")
+                            if not args.dry_run:
+                                cf_post(s, f"{API_BASE}/zones/{zid}/dns_records", token, payload)
+                        # Intentionally NO AAAA deletion for www
 
                 writer.writerow({
                     "fqdn": fqdn, "zone_name": zone_name, "zone_id": zid,
